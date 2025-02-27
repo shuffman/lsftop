@@ -1,0 +1,486 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Curses;
+use Getopt::Long;
+use Time::HiRes qw(usleep);
+use POSIX qw(strftime);
+use Text::Wrap;
+
+# Configuration
+my $CONFIG = {
+    interval => 5,    # Default polling interval in seconds
+    sort_column => 0, # Default sort column (JOBID)
+    sort_reverse => 0,# Default sort direction
+    expanded => {},   # Hash to track expanded job groups
+};
+
+# Parse command line options
+GetOptions(
+    "interval|i=f" => \$CONFIG->{interval},
+    "help|h"       => \&show_help,
+) or show_help();
+
+# Initialize curses
+initscr();
+start_color();
+cbreak();
+noecho();
+keypad(1);
+curs_set(0);  # Hide cursor
+timeout(100); # Non-blocking getch with 100ms timeout
+
+# Define color pairs
+init_pair(1, COLOR_WHITE, COLOR_BLACK);   # Normal text
+init_pair(2, COLOR_GREEN, COLOR_BLACK);   # Running jobs
+init_pair(3, COLOR_YELLOW, COLOR_BLACK);  # Pending jobs
+init_pair(4, COLOR_RED, COLOR_BLACK);     # Error/zombie jobs
+init_pair(5, COLOR_CYAN, COLOR_BLACK);    # Headers
+init_pair(6, COLOR_BLACK, COLOR_WHITE);   # Selected row
+init_pair(7, COLOR_WHITE, COLOR_BLUE);    # Title bar
+
+# Column definitions
+my @COLUMNS = (
+    { name => 'JOBID',     width => 8,  align => 'right' },
+    { name => 'USER',      width => 10, align => 'left' },
+    { name => 'STAT',      width => 5,  align => 'left' },
+    { name => 'QUEUE',     width => 10, align => 'left' },
+    { name => 'FROM_HOST', width => 15, align => 'left' },
+    { name => 'EXEC_HOST', width => 15, align => 'left' },
+    { name => 'JOB_NAME',  width => 20, align => 'left' },
+    { name => 'SUBMIT_TIME', width => 19, align => 'left' },
+    { name => 'CPU_USED',  width => 10, align => 'right' },
+    { name => 'MEM',       width => 10, align => 'right' },
+);
+
+# Status variables
+my $selected_row = 0;
+my $scroll_offset = 0;
+my $running = 1;
+my @jobs = ();
+my @job_groups = ();
+
+# Main loop
+while ($running) {
+    my ($rows, $cols) = getmaxyx();
+    
+    # Query LSF for jobs
+    if (time() % $CONFIG->{interval} < 1) {
+        @jobs = get_lsf_jobs();
+        @job_groups = organize_job_groups(\@jobs);
+        sort_jobs();
+    }
+    
+    # Handle keyboard input
+    handle_input($rows);
+    
+    # Ensure selected row is visible and valid
+    adjust_scroll($rows);
+    
+    # Draw the screen
+    clear();
+    draw_title_bar($cols);
+    draw_header($cols);
+    draw_jobs($rows, $cols);
+    draw_footer($rows, $cols);
+    refresh();
+    
+    # Sleep to avoid hammering the CPU
+    usleep(50000);  # 50ms
+}
+
+# Clean up curses
+endwin();
+exit 0;
+
+# Function to show help and exit
+sub show_help {
+    if (defined &endwin) {
+        endwin();
+    }
+    
+    print <<'HELP';
+LSFtop - A curses-based LSF job monitoring utility
+
+Usage: lsftop [options]
+
+Options:
+  -i, --interval SECONDS   Set polling interval (default: 5 seconds)
+  -h, --help               Show this help message
+
+Keys:
+  q, Q        Quit
+  Up/Down     Navigate through jobs
+  Left/Right  Change sort column
+  s           Toggle sort direction
+  Enter       Expand/collapse job group
+  +           Expand all job groups
+  -           Collapse all job groups
+  r           Refresh immediately
+HELP
+    exit 0;
+}
+
+# Function to get LSF jobs using bjobs
+sub get_lsf_jobs {
+    my @result = ();
+    
+    # Define the fields we want from bjobs
+    my @fields = qw(
+        jobid user stat queue from_host exec_host job_name
+        submit_time cpu_used mem job_group
+    );
+    
+    # Create the bjobs command
+    my $cmd = "bjobs -u all -a -w -noheader -o '" . join(' ', @fields) . "'";
+    
+    # Execute the command and parse results
+    open(my $fh, "$cmd |") or return @result;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @values = split(/\s+/, $line, scalar(@fields));
+        
+        # Create a job hash with the values
+        my %job;
+        for (my $i = 0; $i < scalar(@fields); $i++) {
+            $job{$fields[$i]} = $values[$i] // "";
+        }
+        
+        # Add the job to our results
+        push @result, \%job;
+    }
+    close($fh);
+    
+    return @result;
+}
+
+# Function to organize jobs into job groups
+sub organize_job_groups {
+    my ($jobs_ref) = @_;
+    my @grouped_jobs = ();
+    my %groups;
+    
+    # First, organize jobs by job group
+    foreach my $job (@$jobs_ref) {
+        my $group = $job->{job_group} || "No Group";
+        $groups{$group} ||= [];
+        push @{$groups{$group}}, $job;
+    }
+    
+    # Then, create job group entries
+    foreach my $group_name (sort keys %groups) {
+        my $count = scalar(@{$groups{$group_name}});
+        push @grouped_jobs, {
+            is_group => 1,
+            name => $group_name,
+            count => $count,
+            jobs => $groups{$group_name}
+        };
+    }
+    
+    return @grouped_jobs;
+}
+
+# Function to sort jobs based on current sort settings
+sub sort_jobs {
+    # Get the sort column name
+    my $sort_col = $COLUMNS[$CONFIG->{sort_column}]{name};
+    
+    # Sort each job group internally
+    foreach my $group (@job_groups) {
+        $group->{jobs} = [sort {
+            $CONFIG->{sort_reverse} 
+                ? (lc($b->{$sort_col}) cmp lc($a->{$sort_col}))
+                : (lc($a->{$sort_col}) cmp lc($b->{$sort_col}))
+        } @{$group->{jobs}}];
+    }
+    
+    # Sort the job groups if sorting by job name
+    if ($sort_col eq "JOB_NAME") {
+        @job_groups = sort {
+            $CONFIG->{sort_reverse}
+                ? (lc($b->{name}) cmp lc($a->{name}))
+                : (lc($a->{name}) cmp lc($b->{name}))
+        } @job_groups;
+    }
+}
+
+# Function to handle keyboard input
+sub handle_input {
+    my ($rows) = @_;
+    my $ch = getch();
+    return if $ch eq ERR;  # No key pressed
+    
+    if ($ch eq 'q' || $ch eq 'Q') {
+        $running = 0;
+    }
+    elsif ($ch eq KEY_UP) {
+        $selected_row-- if $selected_row > 0;
+    }
+    elsif ($ch eq KEY_DOWN) {
+        $selected_row++;  # adjust_scroll will handle the max bound
+    }
+    elsif ($ch eq KEY_LEFT) {
+        $CONFIG->{sort_column}--;
+        $CONFIG->{sort_column} = scalar(@COLUMNS) - 1 if $CONFIG->{sort_column} < 0;
+        sort_jobs();
+    }
+    elsif ($ch eq KEY_RIGHT) {
+        $CONFIG->{sort_column}++;
+        $CONFIG->{sort_column} = 0 if $CONFIG->{sort_column} >= scalar(@COLUMNS);
+        sort_jobs();
+    }
+    elsif ($ch eq 's') {
+        $CONFIG->{sort_reverse} = !$CONFIG->{sort_reverse};
+        sort_jobs();
+    }
+    elsif ($ch eq "\n" || $ch eq KEY_ENTER) {
+        # Expand/collapse the selected job group
+        my $row = get_visible_row($selected_row);
+        if ($row && $row->{is_group}) {
+            $CONFIG->{expanded}{$row->{name}} = !$CONFIG->{expanded}{$row->{name}};
+        }
+    }
+    elsif ($ch eq '+') {
+        # Expand all groups
+        foreach my $group (@job_groups) {
+            $CONFIG->{expanded}{$group->{name}} = 1;
+        }
+    }
+    elsif ($ch eq '-') {
+        # Collapse all groups
+        foreach my $group (@job_groups) {
+            $CONFIG->{expanded}{$group->{name}} = 0;
+        }
+    }
+    elsif ($ch eq 'r') {
+        # Immediate refresh
+        @jobs = get_lsf_jobs();
+        @job_groups = organize_job_groups(\@jobs);
+        sort_jobs();
+    }
+}
+
+# Function to get the row object at a visible position
+sub get_visible_row {
+    my ($visible_row) = @_;
+    my $current_row = 0;
+    
+    foreach my $group (@job_groups) {
+        if ($current_row == $visible_row) {
+            return $group;
+        }
+        $current_row++;
+        
+        if ($CONFIG->{expanded}{$group->{name}}) {
+            foreach my $job (@{$group->{jobs}}) {
+                if ($current_row == $visible_row) {
+                    return $job;
+                }
+                $current_row++;
+            }
+        }
+    }
+    
+    return undef;
+}
+
+# Function to count visible rows
+sub count_visible_rows {
+    my $count = 0;
+    
+    foreach my $group (@job_groups) {
+        $count++; # Count the group itself
+        if ($CONFIG->{expanded}{$group->{name}}) {
+            $count += scalar(@{$group->{jobs}}); # Count contained jobs
+        }
+    }
+    
+    return $count;
+}
+
+# Function to adjust scroll to keep selected row visible
+sub adjust_scroll {
+    my ($rows) = @_;
+    
+    # Count how many rows would be visible
+    my $visible_rows = count_visible_rows();
+    
+    # Adjust selected_row if it's beyond the end
+    $selected_row = $visible_rows - 1 if $selected_row >= $visible_rows;
+    $selected_row = 0 if $selected_row < 0;
+    
+    # Calculate the number of rows we can display (minus headers and footers)
+    my $display_rows = $rows - 3;
+    
+    # Adjust scroll_offset to keep selected_row visible
+    if ($selected_row < $scroll_offset) {
+        $scroll_offset = $selected_row;
+    }
+    elsif ($selected_row >= $scroll_offset + $display_rows) {
+        $scroll_offset = $selected_row - $display_rows + 1;
+    }
+}
+
+# Function to draw the title bar
+sub draw_title_bar {
+    my ($cols) = @_;
+    
+    attron(COLOR_PAIR(7));
+    mvaddstr(0, 0, " " x $cols);
+    
+    my $title = "LSFtop - IBM Spectrum LSF Job Monitor";
+    my $time = strftime("%H:%M:%S", localtime);
+    my $interval = "Refresh: $CONFIG->{interval}s";
+    
+    mvaddstr(0, 0, $title);
+    mvaddstr(0, $cols - length($time) - 1, $time);
+    mvaddstr(0, int($cols/2 - length($interval)/2), $interval);
+    
+    attroff(COLOR_PAIR(7));
+}
+
+# Function to draw the column headers
+sub draw_header {
+    my ($cols) = @_;
+    
+    attron(COLOR_PAIR(5));
+    my $header_line = "";
+    my $x = 0;
+    
+    for (my $i = 0; $i < scalar(@COLUMNS); $i++) {
+        my $col = $COLUMNS[$i];
+        my $name = $col->{name};
+        
+        # Highlight sort column
+        if ($i == $CONFIG->{sort_column}) {
+            $name = $CONFIG->{sort_reverse} ? "$name ▼" : "$name ▲";
+        }
+        
+        # Truncate if needed and pad
+        if (length($name) > $col->{width}) {
+            $name = substr($name, 0, $col->{width});
+        } else {
+            $name = $col->{align} eq 'right' ? 
+                sprintf("%*s", $col->{width}, $name) :
+                sprintf("%-*s", $col->{width}, $name);
+        }
+        
+        $header_line .= $name . " ";
+        $x += $col->{width} + 1;
+    }
+    
+    mvaddstr(1, 0, substr($header_line, 0, $cols));
+    attroff(COLOR_PAIR(5));
+}
+
+# Function to draw the jobs on the screen
+sub draw_jobs {
+    my ($rows, $cols) = @_;
+    my $y = 2;  # Start below the header
+    my $visible_row = 0;
+    
+    foreach my $group (@job_groups) {
+        # Skip rows above the scroll offset
+        if ($visible_row >= $scroll_offset) {
+            # Draw the job group row
+            draw_job_row($y, $visible_row, $group, $cols);
+            $y++;
+        }
+        $visible_row++;
+        
+        # Draw jobs in the expanded group
+        if ($CONFIG->{expanded}{$group->{name}}) {
+            foreach my $job (@{$group->{jobs}}) {
+                if ($visible_row >= $scroll_offset) {
+                    draw_job_row($y, $visible_row, $job, $cols);
+                    $y++;
+                }
+                $visible_row++;
+                
+                # Stop if we've filled the screen
+                last if $y >= $rows - 1;
+            }
+        }
+        
+        # Stop if we've filled the screen
+        last if $y >= $rows - 1;
+    }
+}
+
+# Function to draw a single job or job group row
+sub draw_job_row {
+    my ($y, $visible_row, $job, $cols) = @_;
+    
+    # Highlight if this is the selected row
+    if ($visible_row == $selected_row) {
+        attron(COLOR_PAIR(6));
+        mvaddstr($y, 0, " " x $cols);
+    }
+    
+    # If this is a job group
+    if ($job->{is_group}) {
+        my $marker = $CONFIG->{expanded}{$job->{name}} ? "[-]" : "[+]";
+        my $group_text = sprintf("%s %s (%d jobs)", 
+                                 $marker, $job->{name}, $job->{count});
+        mvaddstr($y, 1, substr($group_text, 0, $cols - 2));
+    } 
+    # This is a regular job
+    else {
+        my $x = 2;  # Indent jobs within a group
+        
+        # Choose color based on job status
+        my $color_pair = 1;  # Default (white)
+        if ($job->{stat} =~ /^RUN/) {
+            $color_pair = 2;  # Running (green)
+        } elsif ($job->{stat} =~ /^PEND/) {
+            $color_pair = 3;  # Pending (yellow)
+        } elsif ($job->{stat} =~ /^(EXIT|ZOMBI|UNKWN)/) {
+            $color_pair = 4;  # Error or zombie (red)
+        }
+        
+        if ($visible_row != $selected_row) {
+            attron(COLOR_PAIR($color_pair));
+        }
+        
+        # Draw each column of the job
+        for my $col (@COLUMNS) {
+            my $field_name = lc($col->{name});
+            my $value = $job->{$field_name} // "";
+            
+            # Format the value based on alignment
+            if (length($value) > $col->{width}) {
+                $value = substr($value, 0, $col->{width});
+            } else {
+                $value = $col->{align} eq 'right' ? 
+                    sprintf("%*s", $col->{width}, $value) :
+                    sprintf("%-*s", $col->{width}, $value);
+            }
+            
+            mvaddstr($y, $x, $value);
+            $x += $col->{width} + 1;
+        }
+        
+        if ($visible_row != $selected_row) {
+            attroff(COLOR_PAIR($color_pair));
+        }
+    }
+    
+    if ($visible_row == $selected_row) {
+        attroff(COLOR_PAIR(6));
+    }
+}
+
+# Function to draw the footer
+sub draw_footer {
+    my ($rows, $cols) = @_;
+    
+    attron(COLOR_PAIR(7));
+    mvaddstr($rows - 1, 0, " " x $cols);
+    
+    my $help = "q:Quit  ↑↓:Navigate  ←→:Change Sort  s:Toggle Sort  Enter:Expand/Collapse  r:Refresh";
+    mvaddstr($rows - 1, 0, substr($help, 0, $cols));
+    
+    attroff(COLOR_PAIR(7));
+}
