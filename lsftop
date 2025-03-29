@@ -14,11 +14,17 @@ my $CONFIG = {
     sort_column => 0, # Default sort column (JOBID)
     sort_reverse => 0,# Default sort direction
     expanded => {},   # Hash to track expanded job groups
+    test_mode => 0,   # Test mode flag
+    test_file => "",  # Path to test data file
 };
 
 # Parse command line options
 GetOptions(
     "interval|i=f" => \$CONFIG->{interval},
+    "test|t:s"     => sub { 
+        $CONFIG->{test_mode} = 1; 
+        $CONFIG->{test_file} = $_[1] if defined $_[1];
+    },
     "help|h"       => \&show_help,
 ) or show_help();
 
@@ -63,7 +69,8 @@ my @job_groups = ();
 
 # Main loop
 while ($running) {
-    my ($rows, $cols) = getmaxyx();
+    my $rows = LINES;
+    my $cols = COLS;
     
     # Query LSF for jobs
     if (time() % $CONFIG->{interval} < 1) {
@@ -107,6 +114,9 @@ Usage: lsftop [options]
 
 Options:
   -i, --interval SECONDS   Set polling interval (default: 5 seconds)
+  -t, --test [FILE]        Run in test mode with mock data
+                           If FILE is provided, read mock data from FILE
+                           Otherwise, generate random mock data
   -h, --help               Show this help message
 
 Keys:
@@ -122,7 +132,7 @@ HELP
     exit 0;
 }
 
-# Function to get LSF jobs using bjobs
+# Function to get LSF jobs using bjobs or mock data
 sub get_lsf_jobs {
     my @result = ();
     
@@ -132,7 +142,12 @@ sub get_lsf_jobs {
         submit_time cpu_used mem job_group
     );
     
-    # Create the bjobs command
+    # If test mode is enabled, use mock data
+    if ($CONFIG->{test_mode}) {
+        return get_mock_jobs(\@fields);
+    }
+    
+    # Otherwise, use the real bjobs command
     my $cmd = "bjobs -u all -a -w -noheader -o '" . join(' ', @fields) . "'";
     
     # Execute the command and parse results
@@ -145,6 +160,52 @@ sub get_lsf_jobs {
         my %job;
         for (my $i = 0; $i < scalar(@fields); $i++) {
             $job{$fields[$i]} = $values[$i] // "";
+        }
+        
+        # Add the job to our results
+        push @result, \%job;
+    }
+    close($fh);
+    
+    return @result;
+}
+
+# Function to get mock LSF jobs for testing
+sub get_mock_jobs {
+    my ($fields_ref) = @_;
+    my @result = ();
+    my $fh;
+    
+    # If a test file is specified, read from it
+    if ($CONFIG->{test_file} && -f $CONFIG->{test_file}) {
+        open($fh, '<', $CONFIG->{test_file}) or do {
+            warn "Cannot open test file $CONFIG->{test_file}: $!";
+            return @result;
+        };
+    }
+    # Otherwise, generate random mock data using the test data generator
+    else {
+        my $generator = "./lsftop_test_data.pl";
+        if (-x $generator) {
+            open($fh, "$generator |") or do {
+                warn "Cannot execute $generator: $!";
+                return @result;
+            };
+        } else {
+            warn "Test data generator $generator not found or not executable";
+            return @result;
+        }
+    }
+    
+    # Parse the mock data
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @values = split(/\t/, $line, scalar(@$fields_ref));
+        
+        # Create a job hash with the values
+        my %job;
+        for (my $i = 0; $i < scalar(@$fields_ref); $i++) {
+            $job{$fields_ref->[$i]} = $values[$i] // "";
         }
         
         # Add the job to our results
@@ -190,20 +251,24 @@ sub sort_jobs {
     # Sort each job group internally
     foreach my $group (@job_groups) {
         $group->{jobs} = [sort {
+            my $a_val = defined $a->{$sort_col} ? lc($a->{$sort_col}) : "";
+            my $b_val = defined $b->{$sort_col} ? lc($b->{$sort_col}) : "";
             $CONFIG->{sort_reverse} 
-                ? (lc($b->{$sort_col}) cmp lc($a->{$sort_col}))
-                : (lc($a->{$sort_col}) cmp lc($b->{$sort_col}))
+                ? ($b_val cmp $a_val)
+                : ($a_val cmp $b_val)
         } @{$group->{jobs}}];
     }
     
-    # Sort the job groups if sorting by job name
-    if ($sort_col eq "JOB_NAME") {
-        @job_groups = sort {
-            $CONFIG->{sort_reverse}
-                ? (lc($b->{name}) cmp lc($a->{name}))
-                : (lc($a->{name}) cmp lc($b->{name}))
-        } @job_groups;
-    }
+# Sort the job groups if sorting by job name
+if ($sort_col eq "JOB_NAME") {
+    @job_groups = sort {
+        my $a_name = defined $a->{name} ? lc($a->{name}) : "";
+        my $b_name = defined $b->{name} ? lc($b->{name}) : "";
+        $CONFIG->{sort_reverse}
+            ? ($b_name cmp $a_name)
+            : ($a_name cmp $b_name)
+    } @job_groups;
+}
 }
 
 # Function to handle keyboard input
@@ -328,15 +393,23 @@ sub draw_title_bar {
     my ($cols) = @_;
     
     attron(COLOR_PAIR(7));
-    mvaddstr(0, 0, " " x $cols);
+    move(0, 0);
+    addstr(" " x $cols);
     
     my $title = "LSFtop - IBM Spectrum LSF Job Monitor";
+    if ($CONFIG->{test_mode}) {
+        $title .= " [TEST MODE]";
+    }
+    
     my $time = strftime("%H:%M:%S", localtime);
     my $interval = "Refresh: $CONFIG->{interval}s";
     
-    mvaddstr(0, 0, $title);
-    mvaddstr(0, $cols - length($time) - 1, $time);
-    mvaddstr(0, int($cols/2 - length($interval)/2), $interval);
+    move(0, 0);
+    addstr($title);
+    move(0, $cols - length($time) - 1);
+    addstr($time);
+    move(0, int($cols/2 - length($interval)/2));
+    addstr($interval);
     
     attroff(COLOR_PAIR(7));
 }
@@ -371,7 +444,8 @@ sub draw_header {
         $x += $col->{width} + 1;
     }
     
-    mvaddstr(1, 0, substr($header_line, 0, $cols));
+    move(1, 0);
+    addstr(substr($header_line, 0, $cols));
     attroff(COLOR_PAIR(5));
 }
 
@@ -416,7 +490,8 @@ sub draw_job_row {
     # Highlight if this is the selected row
     if ($visible_row == $selected_row) {
         attron(COLOR_PAIR(6));
-        mvaddstr($y, 0, " " x $cols);
+        move($y, 0);
+        addstr(" " x $cols);
     }
     
     # If this is a job group
@@ -424,7 +499,8 @@ sub draw_job_row {
         my $marker = $CONFIG->{expanded}{$job->{name}} ? "[-]" : "[+]";
         my $group_text = sprintf("%s %s (%d jobs)", 
                                  $marker, $job->{name}, $job->{count});
-        mvaddstr($y, 1, substr($group_text, 0, $cols - 2));
+        move($y, 1);
+        addstr(substr($group_text, 0, $cols - 2));
     } 
     # This is a regular job
     else {
@@ -458,7 +534,8 @@ sub draw_job_row {
                     sprintf("%-*s", $col->{width}, $value);
             }
             
-            mvaddstr($y, $x, $value);
+            move($y, $x);
+            addstr($value);
             $x += $col->{width} + 1;
         }
         
@@ -477,10 +554,12 @@ sub draw_footer {
     my ($rows, $cols) = @_;
     
     attron(COLOR_PAIR(7));
-    mvaddstr($rows - 1, 0, " " x $cols);
+    move($rows - 1, 0);
+    addstr(" " x $cols);
     
     my $help = "q:Quit  ↑↓:Navigate  ←→:Change Sort  s:Toggle Sort  Enter:Expand/Collapse  r:Refresh";
-    mvaddstr($rows - 1, 0, substr($help, 0, $cols));
+    move($rows - 1, 0);
+    addstr(substr($help, 0, $cols));
     
     attroff(COLOR_PAIR(7));
 }
